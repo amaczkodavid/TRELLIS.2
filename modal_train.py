@@ -1,45 +1,3 @@
-"""Train TRELLIS.2 on a single NVIDIA B300 (Blackwell Ultra, sm_103) with Modal.
-
-The script defines one Modal app with four entry points:
-
-* ``train``            - runs ``train.py`` on one B300, resumable across preemptions.
-* ``verify``           - smoke tests the whole software stack on a real B300 (torch, CUDA,
-                         flex_gemm sparse convolutions, the sparse attention backends,
-                         o_voxel, nvdiffrast, nvdiffrec, CuMesh).
-* ``prefetch_weights`` - downloads the Hugging Face checkpoints used by the configs into
-                         the Modal volume, so training never stalls on the Hub.
-* ``main``             - the local entry point that launches ``train``.
-
-All state lives in one Modal volume (``trellis2`` by default):
-
-    /vol/datasets   - preprocessed dataset roots (``metadata.csv`` + latents), see data_toolkit/README.md
-    /vol/results    - ``<run_name>/ckpts``, ``<run_name>/samples``, ``<run_name>/tb_logs``
-    /vol/hf-cache   - Hugging Face / torch.hub cache (DINOv3, pretrained SC-VAE decoders)
-
-Typical usage::
-
-    pip install modal
-    modal setup                                    # once
-    modal secret create huggingface HF_TOKEN=hf_...  # once (DINOv3 is gated on the Hub)
-    modal volume create trellis2                   # once, or let create_if_missing do it
-    modal volume put trellis2 ./datasets/MyDataset /datasets/MyDataset
-
-    # one-off stack verification on the B300 (strongly recommended before a long run)
-    modal run modal_train.py::verify
-
-    # train the shape SC-VAE
-    modal run --detach modal_train.py \\
-        --config configs/scvae/shape_vae_next_dc_f16c32_fp16.json \\
-        --data-dir '{"MyDataset": {"base": "/vol/datasets/MyDataset", "mesh_dump": "/vol/datasets/MyDataset/mesh_dumps", "dual_grid": "/vol/datasets/MyDataset/dual_grid_256", "asset_stats": "/vol/datasets/MyDataset/asset_stats"}}' \\
-        --run-name shape_vae_256
-
-    # follow the logs of a detached run
-    modal app logs trellis2-train
-
-Environment variables (read on the machine that deploys the app) tune the image and the
-hardware request, see the "Run configuration" section below.
-"""
-
 from __future__ import annotations
 
 import json
@@ -57,34 +15,21 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import modal
 
-# --------------------------------------------------------------------------------------
-# Run configuration
-# --------------------------------------------------------------------------------------
 APP_NAME = os.environ.get("TRELLIS_APP_NAME", "trellis2-train")
 
-#: One GB300/B300 GPU per container. Modal accepts the same string for multi GPU
-#: requests (e.g. "B300:4"), but TRELLIS.2 is launched with ``--num_gpus 1`` here.
 GPU_SPEC = os.environ.get("TRELLIS_GPU", "B300")
 GPU_COUNT = 1
 
-#: B300 requires CUDA 13.1+ (Modal host driver ships CUDA 13.3). The devel flavour is
-#: required because o_voxel, flex_gemm, CuMesh, nvdiffrast and nvdiffrec are compiled
-#: from source during the image build.
 CUDA_IMAGE = os.environ.get("TRELLIS_CUDA_IMAGE", "nvidia/cuda:13.1.2-devel-ubuntu24.04")
 PYTHON_VERSION = os.environ.get("TRELLIS_PYTHON_VERSION", "3.12")
 
-#: cu130 wheels are required for sm_103 (B300) kernels. Pin explicitly, e.g.
-#: ``TRELLIS_TORCH_SPEC="torch==2.14.1 torchvision==0.29.1"`` if you need reproducibility.
 TORCH_INDEX_URL = os.environ.get("TRELLIS_TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu130")
 TORCH_SPEC = os.environ.get("TRELLIS_TORCH_SPEC", "torch torchvision")
 
-#: sm_100 code runs on sm_103, and building both keeps the image usable on B200 as well.
 TORCH_CUDA_ARCH_LIST = os.environ.get("TRELLIS_TORCH_CUDA_ARCH_LIST", "10.0;10.3")
 
-#: DINOv3ViTModel (used by every image conditioned config) needs transformers >= 4.56.
 TRANSFORMERS_VERSION = os.environ.get("TRELLIS_TRANSFORMERS_VERSION", "4.57.6")
 
-#: Commit of https://github.com/EasternJournalist/utils3d pinned by the upstream setup.sh.
 UTILS3D_COMMIT = os.environ.get("TRELLIS_UTILS3D_COMMIT", "9a4eb15e4021b67b12c460c7057d642626897ec8")
 
 VOLUME_NAME = os.environ.get("TRELLIS_VOLUME_NAME", "trellis2")
@@ -97,20 +42,13 @@ REPO_REMOTE_PATH = "/opt/trellis2"
 BUILD_DIR = "/opt/build"
 LOCAL_REPO_ROOT = Path(__file__).resolve().parent
 
-#: ``sdpa`` uses PyTorch's fused scaled_dot_product_attention (cuDNN/flash kernels shipped
-#: with torch) for both dense and sparse-varlen attention. It is exact, needs no
-#: flash-attn/xformers build for a brand new architecture, and runs at full speed on B300.
 ATTENTION_BACKEND = os.environ.get("TRELLIS_ATTN_BACKEND", "sdpa")
 SPARSE_CONV_BACKEND = os.environ.get("TRELLIS_CONV_BACKEND", "flex_gemm")
 
-#: Dataloader workers. The trainer falls back to the CPU affinity mask when unset, but a
-#: fixed value keeps throughput predictable across GPU types.
 DATALOADER_WORKERS = int(os.environ.get("TRELLIS_DATALOADER_WORKERS", "24"))
 
 HF_SECRET_NAME = os.environ.get("TRELLIS_HF_SECRET_NAME", "huggingface")
 
-#: Modal's hard cap is 24h per function call; the run resumes from the newest checkpoint
-#: whenever a container is preempted, times out or crashes.
 MAX_RUNTIME_SECONDS = int(os.environ.get("TRELLIS_MAX_RUNTIME_SECONDS", str(24 * 60 * 60)))
 MAX_RETRIES = int(os.environ.get("TRELLIS_MAX_RETRIES", "20"))
 COMMIT_INTERVAL_SECONDS = int(os.environ.get("TRELLIS_COMMIT_INTERVAL_SECONDS", "300"))
@@ -118,11 +56,8 @@ COMMIT_INTERVAL_SECONDS = int(os.environ.get("TRELLIS_COMMIT_INTERVAL_SECONDS", 
 CPU_REQUEST = float(os.environ.get("TRELLIS_CPU", "32"))
 MEMORY_REQUEST_MB = int(os.environ.get("TRELLIS_MEMORY_MB", str(128 * 1024)))
 
-#: Checkpointing every 200 optimizer steps keeps the worst case loss on a preemption to a
-#: few minutes. Set to 0 to keep whatever the config file specifies.
 DEFAULT_I_SAVE = int(os.environ.get("TRELLIS_I_SAVE", "200"))
 
-#: Checkpoints that Hugging Face repositories referenced by the shipped configs.
 PRETRAINED_REPOSITORIES = (
     ("microsoft/TRELLIS.2-4B", ["ckpts/*", "*.json", "*.md"]),
     ("JeffreyXiang/TRELLIS.2-4B", ["ckpts/*", "*.json", "*.md"]),
@@ -213,14 +148,7 @@ LOCAL_PATHS_SENT_TO_THE_CONTAINER_TO_IGNORE = (
 )
 
 
-# --------------------------------------------------------------------------------------
-# Small helpers (pure Python, they also run inside the containers)
-# --------------------------------------------------------------------------------------
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively merge ``override`` into a copy of ``base``.
-
-    Lists and scalars are replaced, dictionaries are merged key by key.
-    """
     merged: Dict[str, Any] = json.loads(json.dumps(base))
     for key, value in override.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
@@ -231,7 +159,6 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 def _ema_rate_list(value: Any) -> List[float]:
-    """Normalise the ``ema_rate`` trainer argument to a list of floats."""
     if isinstance(value, (int, float)):
         return [float(value)]
     if isinstance(value, (list, tuple)):
@@ -240,12 +167,6 @@ def _ema_rate_list(value: Any) -> List[float]:
 
 
 def _checkpoint_file_is_readable(path: Path) -> bool:
-    """Check that a ``torch.save`` archive is complete.
-
-    ``torch.save`` writes a zip container; the central directory lives at the end of the
-    file, therefore a checkpoint interrupted by a preemption or a full disk fails to open.
-    Only the directory is read, so this stays cheap even for multi gigabyte files.
-    """
     if not path.is_file() or path.stat().st_size == 0:
         return False
     try:
@@ -260,7 +181,6 @@ def _find_resumable_step(
     model_names: Sequence[str],
     ema_rates: Sequence[float],
 ) -> Optional[int]:
-    """Return the newest checkpoint step that has every file the trainer needs."""
     if not ckpts_dir.is_dir():
         return None
 
@@ -291,7 +211,6 @@ def _find_resumable_step(
 
 
 def _dataset_paths(data_dir: str) -> List[str]:
-    """Extract every filesystem path from the dataset specification accepted by train.py."""
     try:
         parsed = json.loads(data_dir)
     except json.JSONDecodeError:
@@ -311,7 +230,6 @@ def _dataset_paths(data_dir: str) -> List[str]:
 
 
 def _validate_data_dir(data_dir: str) -> None:
-    """Fail fast with an actionable message when the dataset is not mounted."""
     paths = _dataset_paths(data_dir)
     if not paths:
         raise ValueError(
@@ -330,7 +248,6 @@ def _validate_data_dir(data_dir: str) -> None:
 
 
 def _resolve_config_path(config: str) -> Path:
-    """Resolve a config path, relative paths are taken from the mounted repository."""
     candidate = Path(config)
     if candidate.is_absolute():
         resolved = candidate
@@ -346,14 +263,9 @@ def _resolve_config_path(config: str) -> Path:
 
 
 def _hf_secrets() -> List[modal.Secret]:
-    """Attach the Hugging Face token secret when the workspace defines it.
-
-    The SC-VAE configs train without any gated checkpoint, but every image conditioned flow
-    config loads ``facebook/dinov3-vitl16-pretrain-lvd1689m``, which requires a token.
-    """
     try:
         available_secrets = {secret.name for secret in modal.Secret.objects.list()}
-    except Exception as error:  # noqa: BLE001 - deployment must not depend on this lookup
+    except Exception as error:
         print(
             f"[modal] could not list the workspace secrets ({error}), continuing without "
             f"the {HF_SECRET_NAME!r} secret",
@@ -372,7 +284,6 @@ def _hf_secrets() -> List[modal.Secret]:
 
 
 def _nvidia_smi_summary() -> str:
-    """One line description of the attached GPU, empty string when nvidia-smi is missing."""
     try:
         proc = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
@@ -386,11 +297,7 @@ def _nvidia_smi_summary() -> str:
     return proc.stdout.strip()
 
 
-# --------------------------------------------------------------------------------------
-# Container image
-# --------------------------------------------------------------------------------------
 def _third_party_extension_commands() -> List[str]:
-    """Clone and compile the CUDA extensions TRELLIS.2 depends on."""
     return [
         f"mkdir -p {BUILD_DIR}",
         f"git clone --depth 1 --branch v0.4.0 https://github.com/NVlabs/nvdiffrast.git {BUILD_DIR}/nvdiffrast",
@@ -407,11 +314,6 @@ def _third_party_extension_commands() -> List[str]:
 
 
 def _o_voxel_build_commands() -> List[str]:
-    """Compile o_voxel against the Eigen headers shipped by the distribution.
-
-    The ``o-voxel/third_party/eigen`` submodule is empty in a plain checkout (it lives on
-    gitlab.com), so it is replaced by the packaged Eigen 3 headers installed via apt.
-    """
     return [
         f"rm -rf {BUILD_DIR}/o-voxel/third_party/eigen",
         f"ln -s /usr/include/eigen3 {BUILD_DIR}/o-voxel/third_party/eigen",
@@ -420,7 +322,6 @@ def _o_voxel_build_commands() -> List[str]:
 
 
 def _build_training_image() -> modal.Image:
-    """Full training image: CUDA 13.1 toolkit, torch cu130 and every compiled extension."""
     image = modal.Image.from_registry(CUDA_IMAGE, add_python=PYTHON_VERSION)
     image = image.entrypoint([])
     image = image.apt_install(*APT_PACKAGES)
@@ -454,9 +355,6 @@ app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 
-# --------------------------------------------------------------------------------------
-# Training
-# --------------------------------------------------------------------------------------
 @app.function(
     image=training_image,
     gpu=GPU_SPEC,
@@ -482,20 +380,6 @@ def train(
     ckpt: str = "latest",
     extra_args: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Run ``train.py`` on one B300 and resume automatically after any interruption.
-
-    Args:
-        config: Config file path, absolute or relative to the repository root.
-        data_dir: Dataset directory or the JSON dataset specification of train.py.
-        output_dir: Output directory, relative paths are resolved inside ``/vol/results``.
-        overrides: Deep merge overrides applied on top of the config file.
-        ckpt: ``latest`` (resume from the newest complete checkpoint), ``none`` (start from
-            scratch) or an explicit step number.
-        extra_args: Additional arguments appended to the ``train.py`` command line.
-
-    Returns:
-        A JSON serialisable summary of the run.
-    """
     os.chdir(REPO_REMOTE_PATH)
     if REPO_REMOTE_PATH not in sys.path:
         sys.path.insert(0, REPO_REMOTE_PATH)
@@ -563,7 +447,7 @@ def train(
         try:
             volume.commit()
             print(f"[modal] volume committed ({reason})", flush=True)
-        except Exception as error:  # noqa: BLE001 - a failed commit must not kill training
+        except Exception as error:
             print(f"[modal] volume commit failed ({reason}): {error}", flush=True)
 
     def _commit_loop() -> None:
@@ -637,17 +521,7 @@ def train(
     }
 
 
-# --------------------------------------------------------------------------------------
-# Stack verification
-# --------------------------------------------------------------------------------------
 def _reference_attention(q: Any, k: Any, v: Any) -> Any:
-    """Plain PyTorch attention used as the reference for the fused backends.
-
-    Args:
-        q: [H, L_Q, C] queries.
-        k: [H, L_KV, C] keys.
-        v: [H, L_KV, C] values.
-    """
     torch = sys.modules["torch"]
     scale = 1.0 / math.sqrt(q.shape[-1])
     weights = torch.softmax(torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale, dim=-1)
@@ -665,12 +539,6 @@ def _reference_attention(q: Any, k: Any, v: Any) -> Any:
     env=RUNTIME_ENV,
 )
 def verify() -> Dict[str, Any]:
-    """Execute every kernel family used by training once on the B300.
-
-    Every check is a real forward (and mostly backward) pass, so an incompatible CUDA
-    toolchain, a missing sm_103 kernel or a broken attention backend surfaces here instead
-    of ten minutes into a training run.
-    """
     os.chdir(REPO_REMOTE_PATH)
     if REPO_REMOTE_PATH not in sys.path:
         sys.path.insert(0, REPO_REMOTE_PATH)
@@ -709,7 +577,6 @@ def verify() -> Dict[str, Any]:
     if int(report["total_memory_gb"]) < 200:
         raise RuntimeError(f"Expected a B300 with 262 GB of HBM, got {report['total_memory_gb']} GB")
 
-    # 1. Sparse convolutions (flex_gemm Triton kernels, training critical for every SC-VAE).
     torch.manual_seed(0)
     grid = torch.cartesian_prod(
         torch.arange(4, device="cuda"),
@@ -726,7 +593,6 @@ def verify() -> Dict[str, Any]:
     assert conv_feats.grad is not None and torch.isfinite(conv_feats.grad).all(), "flex_gemm backward failed"
     report["sparse_conv"] = "ok"
 
-    # 2. Sparse variable-length attention (the backend used by all flow models).
     seq_lens = [5, 7, 11]
     num_heads, head_dim = 4, 16
     total_tokens = sum(seq_lens)
@@ -756,7 +622,6 @@ def verify() -> Dict[str, Any]:
     torch.testing.assert_close(varlen_bf16.feats.float(), expected, atol=2e-2, rtol=2e-2)
     report["sparse_attention_bf16"] = "ok"
 
-    # 3. Dense attention (DINOv3 conditioning path and dense transformer blocks).
     dense_qkv = torch.randn(2, 17, 3, num_heads, head_dim, device="cuda", dtype=torch.float32)
     dense_out = scaled_dot_product_attention(dense_qkv)
     dense_expected = torch.stack([
@@ -770,7 +635,6 @@ def verify() -> Dict[str, Any]:
     torch.testing.assert_close(dense_out, dense_expected, atol=1e-5, rtol=1e-5)
     report["dense_attention"] = "ok"
 
-    # 4. Windowed sparse attention: a window larger than the grid must degrade to full attention.
     window_coords = []
     for batch in range(2):
         batch_coords = torch.cartesian_prod(
@@ -805,7 +669,6 @@ def verify() -> Dict[str, Any]:
     assert window_feats.grad is not None and torch.isfinite(window_feats.grad).all(), "windowed attention backward failed"
     report["windowed_attention"] = "ok"
 
-    # 5. o_voxel: CUDA hash/serialisation kernels and a full vxz round trip.
     serialize_coords = torch.cartesian_prod(
         torch.arange(8, device="cuda"),
         torch.arange(8, device="cuda"),
@@ -831,7 +694,6 @@ def verify() -> Dict[str, Any]:
     vxz_path.unlink()
     report["o_voxel"] = "ok"
 
-    # 6. nvdiffrast rasterisation, the renderer backbone of the SC-VAE losses.
     glctx = dr.RasterizeCudaContext()
     vertices = torch.tensor(
         [[[-0.5, -0.5, 0.0, 1.0], [0.5, -0.5, 0.0, 1.0], [0.0, 0.5, 0.0, 1.0]]],
@@ -843,7 +705,6 @@ def verify() -> Dict[str, Any]:
     assert covered > 0, "nvdiffrast rasterised an empty image"
     report["nvdiffrast_pixels"] = covered
 
-    # 7. nvdiffrec environment lighting (PBR SC-VAE losses) and CuMesh mesh processing.
     base_cubemap = torch.full((6, 32, 32, 3), 0.5, device="cuda", dtype=torch.float32)
     env_light = EnvironmentLight(base_cubemap)
     env_light.build_mips()
@@ -863,7 +724,6 @@ def verify() -> Dict[str, Any]:
     assert cu_mesh.num_faces == 12, cu_mesh.num_faces
     report["cumesh"] = "ok"
 
-    # 8. The renderer used inside the SC-VAE training loop, end to end.
     renderer = MeshRenderer({"near": 1.0, "far": 3.0})
     renderer.rendering_options.resolution = 128
     renderer.rendering_options.ssaa = 2
@@ -882,8 +742,6 @@ def verify() -> Dict[str, Any]:
     assert float(rendered["mask"].sum()) > 0, "renderer produced an empty image"
     report["renderer"] = "ok"
 
-    # 9. The attention modules of the transformer blocks (qk RMS norm + RoPE) on top of the
-    #    variable-length backend, for both self and cross attention.
     from trellis2.modules.sparse.attention import SparseMultiHeadAttention
 
     attention_channels, attention_heads = 32, 4
@@ -915,7 +773,6 @@ def verify() -> Dict[str, Any]:
     assert module_feats.grad is not None and torch.isfinite(module_feats.grad).all()
     report["attention_modules"] = "ok"
 
-    # 10. A tiny flow model, once with absolute and once with rotary position embeddings.
     from trellis2.models import SparseStructureFlowModel
 
     for pe_mode in ("ape", "rope"):
@@ -939,7 +796,6 @@ def verify() -> Dict[str, Any]:
         assert flow_x.grad is not None and torch.isfinite(flow_x.grad).all()
         report[f"flow_model_{pe_mode}"] = "ok"
 
-    # 11. Dataset stack and logging: the DINOv3 image conditioner plus the tensorboard writer.
     from torch.utils.tensorboard import SummaryWriter
     from trellis2.datasets import FlexiDualGridDataset
     from trellis2.models import ElasticSLatFlowModel, FlexiDualGridVaeEncoder
@@ -962,9 +818,6 @@ def verify() -> Dict[str, Any]:
     return report
 
 
-# --------------------------------------------------------------------------------------
-# Hugging Face prefetching
-# --------------------------------------------------------------------------------------
 @app.function(
     image=training_image,
     volumes={VOLUME_MOUNT: volume},
@@ -977,15 +830,6 @@ def verify() -> Dict[str, Any]:
 def prefetch_weights(
     repositories: Optional[Sequence[Sequence[Any]]] = None,
 ) -> Dict[str, str]:
-    """Populate the Hugging Face cache volume with every checkpoint the configs reference.
-
-    Args:
-        repositories: Sequence of ``(repo_id, allow_patterns)`` pairs. Defaults to the
-            repositories used by the shipped configs.
-
-    Returns:
-        A mapping from repository id to the resolved local snapshot location.
-    """
     from huggingface_hub import snapshot_download
 
     volume.reload()
@@ -1004,9 +848,6 @@ def prefetch_weights(
     return resolved
 
 
-# --------------------------------------------------------------------------------------
-# Local entry point
-# --------------------------------------------------------------------------------------
 @app.local_entrypoint()
 def main(
     config: str = "configs/scvae/shape_vae_next_dc_f16c32_fp16.json",
@@ -1021,21 +862,6 @@ def main(
     verify_first: bool = False,
     extra_train_args: str = "",
 ) -> None:
-    """Launch a single-B300 training run on Modal.
-
-    Args:
-        config: Config file path relative to the repository root.
-        data_dir: Dataset directory or the JSON dataset specification of train.py.
-        run_name: Output directory name inside ``/vol/results``. Defaults to a timestamped name.
-        overrides: JSON object deep merged on top of the config file.
-        ckpt: ``latest``, ``none`` or an explicit step number.
-        max_steps: Override ``trainer.args.max_steps`` when greater than zero.
-        batch_size: Override ``trainer.args.batch_size_per_gpu`` when greater than zero.
-        i_save: Override ``trainer.args.i_save`` when greater than zero (0 keeps the config value).
-        detach: Return immediately after submitting the job (the run continues on Modal).
-        verify_first: Run the stack verification on a B300 before submitting the training job.
-        extra_train_args: Extra command line flags appended to train.py, shell split.
-    """
     if not data_dir:
         raise ValueError(
             "--data-dir is required. Pass either a directory or the JSON dataset specification "
