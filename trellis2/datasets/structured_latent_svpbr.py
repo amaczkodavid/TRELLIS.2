@@ -1,6 +1,7 @@
 import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 import json
+import logging
 from typing import *
 import numpy as np
 import torch
@@ -14,39 +15,32 @@ from ..utils.data_utils import load_balanced_group_indices
 from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
 
 
+logger = logging.getLogger(__name__)
+
+
 def procedural_studio_envmap(height: int = 256, width: int = 512) -> torch.Tensor:
-    """
-    Build an equirectangular studio environment map without any external asset.
+    if height <= 0 or width <= 0:
+        raise ValueError(f'Environment map size must be positive, got {height}x{width}')
 
-    The map is a three point setup (warm key light, cool fill light, dim rim light) over a
-    smooth sky-to-ground gradient. It gives the sample visualisations of the PBR dataset a
-    readable specular response while keeping the repository free of binary HDRI files.
-
-    Args:
-        height (int): Vertical resolution of the latitude-longitude map.
-        width (int): Horizontal resolution of the latitude-longitude map.
-
-    Returns:
-        (torch.Tensor): A [height, width, 3] float32 tensor on the current CUDA device.
-    """
-    vertical = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]   # 0 zenith, 1 nadir
+    vertical = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
     azimuth = np.linspace(-np.pi, np.pi, width, dtype=np.float32)[None, :]
-    altitude = np.pi * (0.5 - vertical)                                   # +pi/2 zenith, -pi/2 nadir
+    altitude = np.float32(np.pi) * (np.float32(0.5) - vertical)
 
-    horizon_blend = 1.0 / (1.0 + np.exp((vertical - 0.5) * 24.0))         # smooth horizon step
-    sky = np.concatenate([
+    horizon_blend = (1.0 / (1.0 + np.exp((vertical - 0.5) * 24.0)))[..., None]
+    sky = np.stack([
         0.55 - 0.20 * vertical,
         0.62 - 0.22 * vertical,
         0.78 - 0.28 * vertical,
-    ], axis=-1)                                                           # [height, 3]
-    ground = np.concatenate([
+    ], axis=-1)
+    ground = np.stack([
         0.10 + 0.10 * vertical,
         0.09 + 0.09 * vertical,
         0.08 + 0.08 * vertical,
-    ], axis=-1)                                                           # [height, 3]
-    image = ground * (1.0 - horizon_blend) + sky * horizon_blend
+    ], axis=-1)
+    gradient = ground * (1.0 - horizon_blend) + sky * horizon_blend
+    image = np.array(np.broadcast_to(gradient, (height, width, 3)), dtype=np.float32)
 
-    key_direction = (0.9, 1.25)                               # (azimuth, altitude)
+    key_direction = (0.9, 1.25)
     fill_direction = (-2.2, 0.55)
     rim_direction = (2.6, 0.35)
     lights = (
@@ -67,30 +61,38 @@ def procedural_studio_envmap(height: int = 256, width: int = 512) -> torch.Tenso
     return torch.tensor(image, dtype=torch.float32, device='cuda')
 
 
-def load_visualization_envmap() -> 'EnvMap':
-    """
-    Load the environment map used by the PBR sample visualisations.
-
-    The path of an equirectangular ``.exr`` / ``.hdr`` file can be provided through the
-    ``TRELLIS_ENVMAP`` environment variable. When it is not set, or when the file is missing,
-    a procedurally generated studio environment is used.
-
-    Returns:
-        (EnvMap): The environment map, already moved to the GPU.
-    """
+def load_visualization_envmap() -> EnvMap:
     envmap_path = os.environ.get('TRELLIS_ENVMAP')
-    if envmap_path is not None and os.path.isfile(envmap_path):
-        image = cv2.imread(envmap_path, cv2.IMREAD_UNCHANGED)
-        if image is None:
-            raise FileNotFoundError(f'Unable to decode the environment map {envmap_path!r}')
-        return EnvMap(torch.tensor(
-            cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
-            dtype=torch.float32, device='cuda'
-        ))
-    if envmap_path is not None:
-        print(
-            f'[SLatPbr] environment map {envmap_path!r} not found, '
-            'falling back to the procedural studio environment'
+    if envmap_path:
+        if os.path.isfile(envmap_path):
+            image = cv2.imread(envmap_path, cv2.IMREAD_UNCHANGED)
+            if image is None:
+                raise FileNotFoundError(f'Unable to decode the environment map {envmap_path!r}')
+            if image.dtype == np.uint8:
+                image = image.astype(np.float32) / 255.0
+            elif image.dtype == np.uint16:
+                image = image.astype(np.float32) / 65535.0
+            else:
+                image = image.astype(np.float32)
+            if image.ndim == 2:
+                image = image[:, :, None]
+            if image.shape[2] == 1:
+                image = np.repeat(image, 3, axis=2)
+            elif image.shape[2] == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            elif image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+            else:
+                raise ValueError(
+                    f'Unsupported channel count {image.shape[2]} in the environment map {envmap_path!r}'
+                )
+            return EnvMap(torch.tensor(
+                np.ascontiguousarray(image),
+                dtype=torch.float32, device='cuda'
+            ))
+        logger.warning(
+            'Environment map %r not found, falling back to the procedural studio environment',
+            envmap_path,
         )
     return EnvMap(procedural_studio_envmap())
 
@@ -116,12 +118,13 @@ class SLatPbrVisMixin:
         self.pretrained_shape_slat_dec = pretrained_shape_slat_dec
         self.shape_slat_dec_path = shape_slat_dec_path
         self.shape_slat_dec_ckpt = shape_slat_dec_ckpt
-        
+
     def _loading_slat_dec(self):
         if self.pbr_slat_dec is not None and self.shape_slat_dec is not None:
             return
         if self.pbr_slat_dec_path is not None:
-            cfg = json.load(open(os.path.join(self.pbr_slat_dec_path, 'config.json'), 'r'))
+            with open(os.path.join(self.pbr_slat_dec_path, 'config.json'), 'r') as f:
+                cfg = json.load(f)
             decoder = getattr(models, cfg['models']['decoder']['name'])(**cfg['models']['decoder']['args'])
             ckpt_path = os.path.join(self.pbr_slat_dec_path, 'ckpts', f'decoder_{self.pbr_slat_dec_ckpt}.pt')
             decoder.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=True))
@@ -130,7 +133,8 @@ class SLatPbrVisMixin:
         self.pbr_slat_dec = decoder.cuda().eval()
 
         if self.shape_slat_dec_path is not None:
-            cfg = json.load(open(os.path.join(self.shape_slat_dec_path, 'config.json'), 'r'))
+            with open(os.path.join(self.shape_slat_dec_path, 'config.json'), 'r') as f:
+                cfg = json.load(f)
             decoder = getattr(models, cfg['models']['decoder']['name'])(**cfg['models']['decoder']['args'])
             ckpt_path = os.path.join(self.shape_slat_dec_path, 'ckpts', f'decoder_{self.shape_slat_dec_ckpt}.pt')
             decoder.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=True))
@@ -144,7 +148,7 @@ class SLatPbrVisMixin:
         self.pbr_slat_dec = None
         del self.shape_slat_dec
         self.shape_slat_dec = None
-        
+
     @torch.no_grad()
     def decode_latent(self, z, shape_z, batch_size=4):
         self._loading_slat_dec()
@@ -166,67 +170,61 @@ class SLatPbrVisMixin:
                     voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
                     layout = self.layout,
                 )
-                for m, v in zip(mesh, vox)
+                for m, v in zip(mesh, [vox[j] for j in range(len(mesh))])
             ])
         self._delete_slat_dec()
         return reps
-    
+
     @torch.no_grad()
     def visualize_sample(self, sample: dict):
         shape_z = sample['concat_cond'].cuda()
         z = sample['x_0'].cuda()
         reps = self.decode_latent(z, shape_z)
-        
-        # build camera
+
         yaw = [0, np.pi/2, np.pi, 3*np.pi/2]
         yaw_offset = -16 / 180 * np.pi
         yaw = [y + yaw_offset for y in yaw]
         pitch = [20 / 180 * np.pi for _ in range(4)]
         exts, ints = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, 2, 30)
-        
-        # render
+
+        tile_resolution = 512
+        tile = [2, 2]
+
         renderer = PbrMeshRenderer()
-        renderer.rendering_options.resolution = 512
+        renderer.rendering_options.resolution = tile_resolution
         renderer.rendering_options.near = 1
         renderer.rendering_options.far = 100
         renderer.rendering_options.ssaa = 2
         renderer.rendering_options.peel_layers = 8
         envmap = load_visualization_envmap()
-        
+
         images = {}
         for representation in reps:
-            image = {}
-            tile = [2, 2]
+            mosaics = {}
             for j, (ext, intr) in enumerate(zip(exts, ints)):
                 res = renderer.render(representation, ext, intr, envmap=envmap)
+                row = j // tile[1]
+                col = j % tile[1]
                 for k, v in res.items():
-                    if k not in images:
-                        images[k] = []
-                    if k not in image:
-                        image[k] = torch.zeros(3, 1024, 1024).cuda()  
-                    image[k][:, 512 * (j // tile[1]):512 * (j // tile[1] + 1), 512 * (j % tile[1]):512 * (j % tile[1] + 1)] = v
-            for k in images.keys():
-                images[k].append(image[k])
+                    if k not in mosaics:
+                        mosaics[k] = torch.zeros(
+                            3, tile_resolution * tile[0], tile_resolution * tile[1], device='cuda'
+                        )
+                    mosaics[k][
+                        :,
+                        tile_resolution * row:tile_resolution * (row + 1),
+                        tile_resolution * col:tile_resolution * (col + 1),
+                    ] = v
+            for k, mosaic in mosaics.items():
+                if k not in images:
+                    images[k] = []
+                images[k].append(mosaic)
         for k in images.keys():
             images[k] = torch.stack(images[k], dim=0)
         return images
-    
-    
+
+
 class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
-    """
-    structured latent for sparse voxel pbr dataset
-    
-    Args:
-        roots (str): path to the dataset
-        latent_key (str): key of the latent to be used
-        min_aesthetic_score (float): minimum aesthetic score
-        normalization (dict): normalization stats
-        resolution (int): resolution of decoded sparse voxel
-        attrs (list): attributes to be decoded
-        pretained_slat_dec (str): name of the pretrained slat decoder
-        slat_dec_path (str): path to the slat decoder, if given, will override the pretrained_slat_dec
-        slat_dec_ckpt (str): name of the slat decoder checkpoint
-    """
     def __init__(self,
         roots: str,
         *,
@@ -236,7 +234,7 @@ class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
         full_pbr: bool = False,
         pbr_slat_normalization: Optional[dict] = None,
         shape_slat_normalization: Optional[dict] = None,
-        attrs: list[str] = ['base_color', 'metallic', 'roughness', 'emissive', 'alpha'],
+        attrs: Optional[List[str]] = None,
         pretrained_pbr_slat_dec: str = 'JeffreyXiang/TRELLIS.2-4B/ckpts/tex_dec_next_dc_f16c32_fp16',
         pbr_slat_dec_path: Optional[str] = None,
         pbr_slat_dec_ckpt: Optional[str] = None,
@@ -244,7 +242,9 @@ class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
         shape_slat_dec_path: Optional[str] = None,
         shape_slat_dec_ckpt: Optional[str] = None,
         **kwargs
-    ):  
+    ):
+        if attrs is None:
+            attrs = ['base_color', 'metallic', 'roughness', 'emissive', 'alpha']
         self.resolution = resolution
         self.pbr_slat_normalization = pbr_slat_normalization
         self.shape_slat_normalization = shape_slat_normalization
@@ -252,7 +252,7 @@ class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
         self.max_tokens = max_tokens
         self.full_pbr = full_pbr
         self.value_range = (0, 1)
-        
+
         super().__init__(
             roots,
             pretrained_pbr_slat_dec=pretrained_pbr_slat_dec,
@@ -263,18 +263,18 @@ class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
             shape_slat_dec_ckpt=shape_slat_dec_ckpt,
             **kwargs
         )
-        
+
         self.loads = [self.metadata.loc[sha256, 'pbr_latent_tokens'] for _, sha256 in self.instances]
-        
+
         if self.pbr_slat_normalization is not None:
             self.pbr_slat_mean = torch.tensor(self.pbr_slat_normalization['mean']).reshape(1, -1)
             self.pbr_slat_std = torch.tensor(self.pbr_slat_normalization['std']).reshape(1, -1)
-        
+
         if self.shape_slat_normalization is not None:
             self.shape_slat_mean = torch.tensor(self.shape_slat_normalization['mean']).reshape(1, -1)
             self.shape_slat_std = torch.tensor(self.shape_slat_normalization['std']).reshape(1, -1)
-        
-        self.attrs = attrs
+
+        self.attrs = list(attrs)
         self.channels = {
             'base_color': 3,
             'metallic': 1,
@@ -284,10 +284,10 @@ class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
         }
         self.layout = {}
         start = 0
-        for attr in attrs:
+        for attr in self.attrs:
             self.layout[attr] = slice(start, start + self.channels[attr])
             start += self.channels[attr]
-            
+
     def filter_metadata(self, metadata):
         stats = {}
         metadata = metadata[metadata['pbr_latent_encoded'] == True]
@@ -304,34 +304,32 @@ class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
             metadata = metadata[metadata['num_roughness_tex'] > 0]
             stats['Full PBR'] = len(metadata)
         return metadata, stats
-    
+
     def get_instance(self, root, instance):
-        # PBR latent
-        data = np.load(os.path.join(root['pbr_latent'], f'{instance}.npz'))
-        coords = torch.tensor(data['coords']).int()
+        with np.load(os.path.join(root['pbr_latent'], f'{instance}.npz')) as data:
+            coords = torch.tensor(data['coords']).int()
+            feats = torch.tensor(data['feats']).float()
         coords = torch.cat([torch.zeros_like(coords)[:, :1], coords], dim=1)
-        feats = torch.tensor(data['feats']).float()
         if self.pbr_slat_normalization is not None:
             feats = (feats - self.pbr_slat_mean) / self.pbr_slat_std
         pbr_z = SparseTensor(feats, coords)
-        
-        # Shape latent
-        data = np.load(os.path.join(root['shape_latent'], f'{instance}.npz'))
-        coords = torch.tensor(data['coords']).int()
+
+        with np.load(os.path.join(root['shape_latent'], f'{instance}.npz')) as data:
+            coords = torch.tensor(data['coords']).int()
+            feats = torch.tensor(data['feats']).float()
         coords = torch.cat([torch.zeros_like(coords)[:, :1], coords], dim=1)
-        feats = torch.tensor(data['feats']).float()
         if self.shape_slat_normalization is not None:
             feats = (feats - self.shape_slat_mean) / self.shape_slat_std
         shape_z = SparseTensor(feats, coords)
-        
+
         assert torch.equal(shape_z.coords, pbr_z.coords), \
             f"Shape latent and PBR latent have different coordinates: {shape_z.coords.shape} vs {pbr_z.coords.shape}"
-            
+
         return {
             'x_0': pbr_z,
             'concat_cond': shape_z,
         }
-        
+
     @staticmethod
     def collate_fn(batch, split_size=None):
         if split_size is None:
@@ -353,16 +351,13 @@ class SLatPbr(SLatPbrVisMixin, StandardDatasetBase):
                     pack[k] = sum([b[k] for b in sub_batch], [])
                 else:
                     pack[k] = [b[k] for b in sub_batch]
-            
+
             packs.append(pack)
-        
+
         if split_size is None:
             return packs[0]
         return packs
 
 
 class ImageConditionedSLatPbr(ImageConditionedMixin, SLatPbr):
-    """
-    Image conditioned structured latent dataset
-    """
     pass
