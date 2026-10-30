@@ -1,4 +1,3 @@
-# Read Arguments
 TEMP=`getopt -o h --long help,new-env,basic,flash-attn,cumesh,o-voxel,flexgemm,nvdiffrast,nvdiffrec -n 'setup.sh' -- "$@"`
 
 eval set -- "$TEMP"
@@ -55,7 +54,6 @@ if [ "$HELP" = true ] ; then
     return
 fi
 
-# Get system information
 WORKDIR=$(pwd)
 if command -v nvidia-smi > /dev/null; then
     PLATFORM="cuda"
@@ -93,7 +91,7 @@ if [ "$FLASHATTN" = true ] ; then
         git clone --recursive https://github.com/ROCm/flash-attention.git /tmp/extensions/flash-attention
         cd /tmp/extensions/flash-attention
         git checkout tags/v2.7.3-cktile
-        GPU_ARCHS=gfx942 python setup.py install #MI300 series
+        GPU_ARCHS=gfx942 python setup.py install
         cd $WORKDIR
     else
         echo "[FLASHATTN] Unsupported platform: $PLATFORM"
