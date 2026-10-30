@@ -1,5 +1,6 @@
 from typing import *
 import torch
+import torch.nn.functional as F
 import math
 from .. import SparseTensor
 from .. import config
@@ -9,6 +10,71 @@ __all__ = [
     'sparse_windowed_scaled_dot_product_self_attention',
     'sparse_windowed_scaled_dot_product_cross_attention',
 ]
+
+
+def _block_diagonal_scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_seqlen: Union[List[int], torch.Tensor],
+    kv_seqlen: Optional[Union[List[int], torch.Tensor]] = None,
+) -> torch.Tensor:
+    """
+    Exact block-diagonal (i.e. non-overlapping window) scaled dot product attention.
+
+    The sequences are grouped by length, and every group is evaluated with a single batched
+    `scaled_dot_product_attention` call. This is mathematically identical to
+    `xops.memory_efficient_attention` with a `BlockDiagonalMask`, requires no third party
+    package, and never pads, so no masked out position can contribute to a softmax.
+
+    Args:
+        q (torch.Tensor): A [T_Q, H, Ci] tensor with the queries of all windows concatenated.
+        k (torch.Tensor): A [T_KV, H, Ci] tensor with the keys of all windows concatenated.
+        v (torch.Tensor): A [T_KV, H, Co] tensor with the values of all windows concatenated.
+        q_seqlen (List[int] or torch.Tensor): Length of every query window, in concatenation order.
+        kv_seqlen (List[int] or torch.Tensor): Length of every key/value window. Defaults to q_seqlen.
+
+    Returns:
+        (torch.Tensor): A [T_Q, H, Co] tensor.
+    """
+    if kv_seqlen is None:
+        kv_seqlen = q_seqlen
+    q_seqlen = q_seqlen.tolist() if torch.is_tensor(q_seqlen) else list(q_seqlen)
+    kv_seqlen = kv_seqlen.tolist() if torch.is_tensor(kv_seqlen) else list(kv_seqlen)
+    assert len(q_seqlen) == len(kv_seqlen), \
+        f'Number of query windows ({len(q_seqlen)}) and key/value windows ({len(kv_seqlen)}) must match'
+    assert q.shape[0] == sum(q_seqlen), \
+        f'Query tensor holds {q.shape[0]} tokens but the window lengths sum to {sum(q_seqlen)}'
+    assert k.shape[0] == sum(kv_seqlen), \
+        f'Key tensor holds {k.shape[0]} tokens but the window lengths sum to {sum(kv_seqlen)}'
+    assert v.shape[0] == sum(kv_seqlen), \
+        f'Value tensor holds {v.shape[0]} tokens but the window lengths sum to {sum(kv_seqlen)}'
+
+    window_offsets: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    q_start = 0
+    kv_start = 0
+    for q_len, kv_len in zip(q_seqlen, kv_seqlen):
+        window_offsets.setdefault((int(q_len), int(kv_len)), []).append((q_start, kv_start))
+        q_start += q_len
+        kv_start += kv_len
+
+    out: Optional[torch.Tensor] = None
+    for (q_len, kv_len), offsets in window_offsets.items():
+        q_starts = torch.tensor([offset[0] for offset in offsets], dtype=torch.long, device=q.device)
+        kv_starts = torch.tensor([offset[1] for offset in offsets], dtype=torch.long, device=k.device)
+        q_index = q_starts.unsqueeze(1) + torch.arange(q_len, dtype=torch.long, device=q.device).unsqueeze(0)
+        kv_index = kv_starts.unsqueeze(1) + torch.arange(kv_len, dtype=torch.long, device=k.device).unsqueeze(0)
+        q_batched = q[q_index].transpose(1, 2)      # [B, H, L_Q, Ci]
+        k_batched = k[kv_index].transpose(1, 2)     # [B, H, L_KV, Ci]
+        v_batched = v[kv_index].transpose(1, 2)     # [B, H, L_KV, Co]
+        out_batched = F.scaled_dot_product_attention(q_batched, k_batched, v_batched)   # [B, H, L_Q, Co]
+        out_batched = out_batched.transpose(1, 2)                                       # [B, L_Q, H, Co]
+        if out is None:
+            out = torch.zeros(q.shape[0], q.shape[1], v.shape[2], dtype=q.dtype, device=q.device)
+        out = out.index_put((q_index,), out_batched.to(out.dtype))
+
+    assert out is not None, 'Block diagonal attention received an empty batch'
+    return out
 
 
 def calc_window_partition(
@@ -59,6 +125,10 @@ def calc_window_partition(
         attn_func_args = {
             'cu_seqlens': torch.cat([torch.tensor([0], device=tensor.device), torch.cumsum(seq_lens, dim=0)], dim=0).int(),
             'max_seqlen': torch.max(seq_lens)
+        }
+    elif config.ATTN == 'sdpa':
+        attn_func_args = {
+            'seq_lens': seq_lens
         }
 
     return fwd_indices, bwd_indices, seq_lens, attn_func_args
@@ -113,6 +183,9 @@ def sparse_windowed_scaled_dot_product_self_attention(
         if 'flash_attn' not in globals():
             import flash_attn
         out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv_feats, **attn_func_args)  # [M, H, C]
+    elif config.ATTN == 'sdpa':
+        q, k, v = qkv_feats.unbind(dim=1)                                               # [M, H, C]
+        out = _block_diagonal_scaled_dot_product_attention(q, k, v, attn_func_args['seq_lens'])
 
     out = out[bwd_indices]      # [T, H, C]
 
@@ -183,6 +256,12 @@ def sparse_windowed_scaled_dot_product_cross_attention(
         out = flash_attn.flash_attn_varlen_kvpacked_func(q_feats, kv_feats,
             cu_seqlens_q=q_attn_func_args['cu_seqlens'], cu_seqlens_k=kv_attn_func_args['cu_seqlens'],
             max_seqlen_q=q_attn_func_args['max_seqlen'], max_seqlen_k=kv_attn_func_args['max_seqlen'],
+        )  # [M, H, C]
+    elif config.ATTN == 'sdpa':
+        k, v = kv_feats.unbind(dim=1)                                                   # [M, H, C]
+        out = _block_diagonal_scaled_dot_product_attention(
+            q_feats, k, v,
+            q_attn_func_args['seq_lens'], kv_attn_func_args['seq_lens'],
         )  # [M, H, C]
 
     out = out[q_bwd_indices]      # [T, H, C]

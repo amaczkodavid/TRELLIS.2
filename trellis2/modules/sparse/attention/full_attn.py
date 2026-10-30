@@ -1,5 +1,6 @@
 from typing import *
 import torch
+import torch.nn.functional as F
 from .. import VarLenTensor
 from .. import config
 
@@ -7,6 +8,60 @@ from .. import config
 __all__ = [
     'sparse_scaled_dot_product_attention',
 ]
+
+
+def _varlen_scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_seqlen: List[int],
+    kv_seqlen: List[int],
+) -> torch.Tensor:
+    """
+    Exact variable-length scaled dot product attention on flattened sequences.
+
+    The sequences of a batch are processed independently (which is what a block-diagonal
+    attention bias expressed by varlen kernels does), so the result is mathematically
+    identical to `flash_attn_varlen_func` / `xops.memory_efficient_attention` with a
+    `BlockDiagonalMask`, without requiring any third party attention package. Padding is
+    never introduced, hence no masked-out positions can leak into the softmax.
+
+    Args:
+        q (torch.Tensor): A [T_Q, H, Ci] tensor with the queries of all sequences concatenated.
+        k (torch.Tensor): A [T_KV, H, Ci] tensor with the keys of all sequences concatenated.
+        v (torch.Tensor): A [T_KV, H, Co] tensor with the values of all sequences concatenated.
+        q_seqlen (List[int]): Length of every query sequence, in concatenation order.
+        kv_seqlen (List[int]): Length of every key/value sequence, in concatenation order.
+
+    Returns:
+        (torch.Tensor): A [T_Q, H, Co] tensor.
+    """
+    assert len(q_seqlen) == len(kv_seqlen), \
+        f'Number of query and key/value sequences must match, got {len(q_seqlen)} and {len(kv_seqlen)}'
+    assert q.shape[0] == sum(q_seqlen), \
+        f'Query tensor holds {q.shape[0]} tokens but the sequence lengths sum to {sum(q_seqlen)}'
+    assert k.shape[0] == sum(kv_seqlen), \
+        f'Key tensor holds {k.shape[0]} tokens but the sequence lengths sum to {sum(kv_seqlen)}'
+    assert v.shape[0] == sum(kv_seqlen), \
+        f'Value tensor holds {v.shape[0]} tokens but the sequence lengths sum to {sum(kv_seqlen)}'
+
+    num_heads = q.shape[1]
+    outputs = []
+    q_start = 0
+    kv_start = 0
+    for q_len, kv_len in zip(q_seqlen, kv_seqlen):
+        q_i = q[q_start:q_start + q_len].transpose(0, 1).unsqueeze(0)       # [1, H, L_Q, Ci]
+        k_i = k[kv_start:kv_start + kv_len].transpose(0, 1).unsqueeze(0)    # [1, H, L_KV, Ci]
+        v_i = v[kv_start:kv_start + kv_len].transpose(0, 1).unsqueeze(0)    # [1, H, L_KV, Co]
+        out_i = F.scaled_dot_product_attention(q_i, k_i, v_i)               # [1, H, L_Q, Co]
+        outputs.append(out_i[0].transpose(0, 1).reshape(q_len, num_heads, v.shape[2]))
+        q_start += q_len
+        kv_start += kv_len
+
+    assert q_start == q.shape[0] and kv_start == k.shape[0], 'Attention sequence bookkeeping error'
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
 
 
 @overload
@@ -211,6 +266,12 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         out = flash_attn_3.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_q_seqlen, max_kv_seqlen)
+    elif config.ATTN == 'sdpa':
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        out = _varlen_scaled_dot_product_attention(q, k, v, q_seqlen, kv_seqlen)
     else:
         raise ValueError(f"Unknown attention module: {config.ATTN}")
     
