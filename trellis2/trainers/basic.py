@@ -268,6 +268,27 @@ class BasicTrainer:
             else:
                 self.grad_clip = getattr(grad_clip_utils, self.grad_clip['name'])(**self.grad_clip['args'])
 
+    @staticmethod
+    def resolve_num_workers() -> int:
+        """
+        Number of dataloader workers.
+
+        The `DATALOADER_NUM_WORKERS` environment variable takes precedence, which matters in
+        containers where the requested CPU count is a slice of a much larger machine (Modal,
+        Kubernetes). Otherwise the worker count follows the CPU affinity mask of the process
+        divided by the number of visible GPUs, which is what the original
+        `os.cpu_count() / torch.cuda.device_count()` heuristic intends.
+        """
+        override = os.environ.get('DATALOADER_NUM_WORKERS')
+        if override is not None and override != '':
+            return max(1, int(override))
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except AttributeError:
+            available_cpus = os.cpu_count() or 1
+        num_gpus = max(1, torch.cuda.device_count())
+        return max(1, int(np.ceil(available_cpus / num_gpus)))
+
     def prepare_dataloader(self, **kwargs):
         """
         Prepare dataloader.
@@ -279,7 +300,7 @@ class BasicTrainer:
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size_per_gpu,
-            num_workers=int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
+            num_workers=self.resolve_num_workers(),
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,

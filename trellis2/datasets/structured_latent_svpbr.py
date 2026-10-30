@@ -14,6 +14,87 @@ from ..utils.data_utils import load_balanced_group_indices
 from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
 
 
+def procedural_studio_envmap(height: int = 256, width: int = 512) -> torch.Tensor:
+    """
+    Build an equirectangular studio environment map without any external asset.
+
+    The map is a three point setup (warm key light, cool fill light, dim rim light) over a
+    smooth sky-to-ground gradient. It gives the sample visualisations of the PBR dataset a
+    readable specular response while keeping the repository free of binary HDRI files.
+
+    Args:
+        height (int): Vertical resolution of the latitude-longitude map.
+        width (int): Horizontal resolution of the latitude-longitude map.
+
+    Returns:
+        (torch.Tensor): A [height, width, 3] float32 tensor on the current CUDA device.
+    """
+    vertical = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]   # 0 zenith, 1 nadir
+    azimuth = np.linspace(-np.pi, np.pi, width, dtype=np.float32)[None, :]
+    altitude = np.pi * (0.5 - vertical)                                   # +pi/2 zenith, -pi/2 nadir
+
+    horizon_blend = 1.0 / (1.0 + np.exp((vertical - 0.5) * 24.0))         # smooth horizon step
+    sky = np.concatenate([
+        0.55 - 0.20 * vertical,
+        0.62 - 0.22 * vertical,
+        0.78 - 0.28 * vertical,
+    ], axis=-1)                                                           # [height, 3]
+    ground = np.concatenate([
+        0.10 + 0.10 * vertical,
+        0.09 + 0.09 * vertical,
+        0.08 + 0.08 * vertical,
+    ], axis=-1)                                                           # [height, 3]
+    image = ground * (1.0 - horizon_blend) + sky * horizon_blend
+
+    key_direction = (0.9, 1.25)                               # (azimuth, altitude)
+    fill_direction = (-2.2, 0.55)
+    rim_direction = (2.6, 0.35)
+    lights = (
+        (key_direction, 5.5, np.array([1.00, 0.95, 0.88], dtype=np.float32)),
+        (fill_direction, 2.2, np.array([0.80, 0.88, 1.00], dtype=np.float32)),
+        (rim_direction, 1.4, np.array([0.95, 0.92, 0.98], dtype=np.float32)),
+    )
+    for (light_azimuth, light_altitude), intensity, color in lights:
+        angular_distance = np.arccos(np.clip(
+            np.sin(altitude) * np.sin(light_altitude)
+            + np.cos(altitude) * np.cos(light_altitude) * np.cos(azimuth - light_azimuth),
+            -1.0, 1.0,
+        ))
+        falloff = np.exp(-0.5 * (angular_distance / 0.22) ** 2) * intensity
+        image = image + falloff[..., None] * color[None, None, :]
+
+    image = np.clip(image, 0.0, 16.0).astype(np.float32)
+    return torch.tensor(image, dtype=torch.float32, device='cuda')
+
+
+def load_visualization_envmap() -> 'EnvMap':
+    """
+    Load the environment map used by the PBR sample visualisations.
+
+    The path of an equirectangular ``.exr`` / ``.hdr`` file can be provided through the
+    ``TRELLIS_ENVMAP`` environment variable. When it is not set, or when the file is missing,
+    a procedurally generated studio environment is used.
+
+    Returns:
+        (EnvMap): The environment map, already moved to the GPU.
+    """
+    envmap_path = os.environ.get('TRELLIS_ENVMAP')
+    if envmap_path is not None and os.path.isfile(envmap_path):
+        image = cv2.imread(envmap_path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise FileNotFoundError(f'Unable to decode the environment map {envmap_path!r}')
+        return EnvMap(torch.tensor(
+            cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+            dtype=torch.float32, device='cuda'
+        ))
+    if envmap_path is not None:
+        print(
+            f'[SLatPbr] environment map {envmap_path!r} not found, '
+            'falling back to the procedural studio environment'
+        )
+    return EnvMap(procedural_studio_envmap())
+
+
 class SLatPbrVisMixin:
     def __init__(
         self,
@@ -110,10 +191,7 @@ class SLatPbrVisMixin:
         renderer.rendering_options.far = 100
         renderer.rendering_options.ssaa = 2
         renderer.rendering_options.peel_layers = 8
-        envmap = EnvMap(torch.tensor(
-            cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-            dtype=torch.float32, device='cuda'
-        ))
+        envmap = load_visualization_envmap()
         
         images = {}
         for representation in reps:
